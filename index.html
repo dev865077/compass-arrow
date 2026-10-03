@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d12">
+<title>Point At The World</title>
+<style>
+  :root { --fg:#e8ecf3; --dim:#8a93a6; --acc:#ff5a3c; --bg:#0b0d12; --panel:rgba(18,22,30,.82); }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; overflow:hidden; }
+  #scene { position:fixed; inset:0; }
+  #top { position:fixed; top:0; left:0; right:0; padding:calc(env(safe-area-inset-top) + 14px) 16px 0; text-align:center; pointer-events:none; }
+  #big { font-size:clamp(34px,11vw,72px); font-weight:800; line-height:1.05; letter-spacing:-.02em; text-shadow:0 2px 18px rgba(0,0,0,.6); word-break:break-word; }
+  #sub { margin-top:6px; font-size:15px; color:var(--dim); min-height:1.2em; }
+  #dist { margin-top:4px; font-size:20px; font-weight:600; color:var(--acc); min-height:1.2em; }
+  #bottom { position:fixed; left:0; right:0; bottom:0; padding:12px 14px calc(env(safe-area-inset-bottom) + 12px);
+    background:var(--panel); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); border-top:1px solid #1f2533; }
+  .row { display:flex; gap:8px; margin-bottom:8px; }
+  input { flex:1; min-width:0; font-size:16px; padding:11px 12px; border-radius:10px; border:1px solid #2a3142; background:#121620; color:var(--fg); outline:none; }
+  input:focus { border-color:var(--acc); }
+  button { font-size:15px; padding:11px 14px; border-radius:10px; border:1px solid #2a3142; background:#1a2030; color:var(--fg); font-weight:600; }
+  button:active { transform:scale(.97); }
+  button.primary { background:var(--acc); border-color:var(--acc); color:#fff; }
+  .presets button { flex:1; padding:9px 6px; font-size:14px; }
+  #status { font-size:12px; color:var(--dim); line-height:1.45; }
+  #status b { color:var(--fg); font-weight:600; }
+  #overlay { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:rgba(5,7,10,.88); z-index:10; padding:24px; }
+  #overlay .card { max-width:360px; text-align:center; }
+  #overlay h1 { font-size:24px; margin:0 0 10px; }
+  #overlay p { color:var(--dim); font-size:15px; line-height:1.45; margin:0 0 18px; }
+  #manual { display:none; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<div id="scene"></div>
+
+<div id="top">
+  <div id="big">—</div>
+  <div id="sub">Rotate your phone to point at a country</div>
+  <div id="dist"></div>
+</div>
+
+<div id="bottom">
+  <div class="row">
+    <input id="q" type="text" placeholder="Place name or lat, lon" autocomplete="off" enterkeyhint="go">
+    <button id="go" class="primary">Go</button>
+  </div>
+  <div class="row presets">
+    <button data-q="China">China</button>
+    <button data-q="Tokyo">Tokyo</button>
+    <button data-q="Paris">Paris</button>
+    <button id="live">Live</button>
+  </div>
+  <div class="row" id="manual">
+    <input id="mlat" type="text" inputmode="decimal" placeholder="Your lat">
+    <input id="mlon" type="text" inputmode="decimal" placeholder="Your lon">
+    <button id="mset">Set</button>
+  </div>
+  <div id="status">Starting…</div>
+</div>
+
+<div id="overlay">
+  <div class="card">
+    <h1>Point at the world</h1>
+    <p>This uses your compass and location to aim a 3D arrow at any place on Earth, or tell you which country you're pointing at.</p>
+    <button id="start" class="primary" style="width:100%;font-size:17px;padding:14px">Start</button>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- State ----------
+  var state = {
+    lat: null, lon: null, locSource: 'none',
+    heading: null,            // raw compass heading (deg clockwise from true/magnetic north)
+    smoothHeading: null,
+    compassOK: false, compassMsg: 'waiting',
+    geoMsg: 'waiting',
+    target: null,             // {name, lat, lon}
+    liveCountry: null,
+    liveMsg: '',
+    lookDistanceKm: 1500      // how far along the heading live mode "looks"
+  };
+  var $ = function (id) { return document.getElementById(id); };
+  var D2R = Math.PI / 180, R2D = 180 / Math.PI;
+
+  // ---------- Math ----------
+  function norm360(a) { a %= 360; return a < 0 ? a + 360 : a; }
+  function angDiff(a, b) { var d = norm360(b - a); return d > 180 ? d - 360 : d; } // shortest a->b
+  function bearing(lat1, lon1, lat2, lon2) {
+    var p1 = lat1 * D2R, p2 = lat2 * D2R, dl = (lon2 - lon1) * D2R;
+    var y = Math.sin(dl) * Math.cos(p2);
+    var x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+    return norm360(Math.atan2(y, x) * R2D);
+  }
+  function haversineKm(lat1, lon1, lat2, lon2) {
+    var R = 6371, dp = (lat2 - lat1) * D2R, dl = (lon2 - lon1) * D2R;
+    var a = Math.sin(dp / 2) * Math.sin(dp / 2) + Math.cos(lat1 * D2R) * Math.cos(lat2 * D2R) * Math.sin(dl / 2) * Math.sin(dl / 2);
+    return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+  function destination(lat, lon, brg, km) {
+    var R = 6371, d = km / R, t = brg * D2R, p1 = lat * D2R, l1 = lon * D2R;
+    var p2 = Math.asin(Math.sin(p1) * Math.cos(d) + Math.cos(p1) * Math.sin(d) * Math.cos(t));
+    var l2 = l1 + Math.atan2(Math.sin(t) * Math.sin(d) * Math.cos(p1), Math.cos(d) - Math.sin(p1) * Math.sin(p2));
+    return { lat: p2 * R2D, lon: ((l2 * R2D + 540) % 360) - 180 };
+  }
+  function fmtKm(km) { return km >= 100 ? Math.round(km).toLocaleString() + ' km' : km.toFixed(1) + ' km'; }
+  function cardinal(b) { return ['N','NE','E','SE','S','SW','W','NW'][Math.round(norm360(b) / 45) % 8]; }
+
+  // ---------- Nominatim (shared throttle, ~1 req / 1.5s) ----------
+  var NOM = 'https://nominatim.openstreetmap.org';
+  var lastReq = 0, MIN_GAP = 1500;
+  function throttledFetch(url) {
+    var wait = Math.max(0, lastReq + MIN_GAP - Date.now());
+    lastReq = Date.now() + wait;
+    return new Promise(function (r) { setTimeout(r, wait); }).then(function () {
+      return fetch(url, { headers: { 'Accept': 'application/json', 'Accept-Language': navigator.language || 'en' } });
+    }).then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); });
+  }
+  function geocode(q) {
+    return throttledFetch(NOM + '/search?q=' + encodeURIComponent(q) + '&format=json&limit=1').then(function (j) {
+      if (!j || !j.length) throw new Error('Not found');
+      return { name: j[0].display_name, lat: parseFloat(j[0].lat), lon: parseFloat(j[0].lon) };
+    });
+  }
+  var revCache = {};
+  try { revCache = JSON.parse(localStorage.getItem('revCache') || '{}'); } catch (e) {}
+  function reverseCountry(lat, lon) {
+    var key = lat.toFixed(1) + ',' + lon.toFixed(1);
+    if (key in revCache) return Promise.resolve(revCache[key]);
+    return throttledFetch(NOM + '/reverse?lat=' + lat + '&lon=' + lon + '&format=json&zoom=3&addressdetails=1').then(function (j) {
+      var c = (j && j.address && j.address.country) || null; // null = ocean / nothing
+      revCache[key] = c;
+      try { localStorage.setItem('revCache', JSON.stringify(revCache)); } catch (e) {}
+      return c;
+    });
+  }
+
+  // ---------- Three.js scene ----------
+  var renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setClearColor(0x0b0d12);
+  $('scene').appendChild(renderer.domElement);
+  var scene = new THREE.Scene();
+  scene.fog = new THREE.Fog(0x0b0d12, 8, 22);
+  var camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+  camera.position.set(0, 6.5, 5.5);
+  camera.lookAt(0, 0, -0.3);
+
+  scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x202030, 0.85));
+  var dl = new THREE.DirectionalLight(0xffffff, 0.9); dl.position.set(3, 8, 4); scene.add(dl);
+
+  // ground ring / compass rose
+  var ring = new THREE.Mesh(new THREE.RingGeometry(2.9, 3.0, 96), new THREE.MeshBasicMaterial({ color: 0x2a3142, side: THREE.DoubleSide }));
+  ring.rotation.x = -Math.PI / 2; scene.add(ring);
+  var grid = new THREE.PolarGridHelper(3, 16, 4, 64, 0x1c2230, 0x1c2230); scene.add(grid);
+
+  // Arrow pointing along -Z (screen "up / forward") at rotation 0
+  var arrow = new THREE.Group();
+  var mat = new THREE.MeshStandardMaterial({ color: 0xff5a3c, metalness: 0.25, roughness: 0.35, emissive: 0x3a0d05 });
+  var shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 2.2, 24), mat);
+  shaft.rotation.x = -Math.PI / 2; shaft.position.z = 0.3;
+  var head = new THREE.Mesh(new THREE.ConeGeometry(0.48, 1.1, 32), mat);
+  head.rotation.x = -Math.PI / 2; head.position.z = -1.35;
+  arrow.add(shaft); arrow.add(head);
+  arrow.position.y = 0.5;
+  scene.add(arrow);
+
+  // "N" marker that rotates opposite to heading, so true north stays put in the world
+  var north = new THREE.Group();
+  var nMarker = new THREE.Mesh(new THREE.ConeGeometry(0.14, 0.35, 12), new THREE.MeshBasicMaterial({ color: 0x5aa9ff }));
+  nMarker.rotation.x = -Math.PI / 2; nMarker.position.set(0, 0.05, -3.25);
+  north.add(nMarker); scene.add(north);
+
+  function resize() {
+    var w = window.innerWidth, h = window.innerHeight;
+    renderer.setSize(w, h); camera.aspect = w / h;
+    camera.position.set(0, w < h ? 7.5 : 6, w < h ? 6.5 : 5);
+    camera.lookAt(0, 0, -0.3);
+    camera.updateProjectionMatrix();
+  }
+  window.addEventListener('resize', resize); resize();
+
+  var arrowAngle = 0, northAngle = 0, spin = 0;
+  function animate() {
+    requestAnimationFrame(animate);
+    // smooth heading
+    if (state.heading != null) {
+      if (state.smoothHeading == null) state.smoothHeading = state.heading;
+      state.smoothHeading = norm360(state.smoothHeading + angDiff(state.smoothHeading, state.heading) * 0.12);
+    }
+    var h = state.smoothHeading;
+    var desired; // degrees clockwise from screen-forward
+    if (h == null) { spin += 0.4; desired = spin; }
+    else if (state.target && state.lat != null) desired = bearing(state.lat, state.lon, state.target.lat, state.target.lon) - h;
+    else desired = 0; // live mode: arrow = where phone points
+    arrowAngle += angDiff(arrowAngle, desired) * 0.15;
+    northAngle += angDiff(northAngle, h == null ? 0 : -h) * 0.15;
+    arrow.rotation.y = -arrowAngle * D2R;   // clockwise on screen
+    north.rotation.y = -northAngle * D2R;
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  // ---------- Compass ----------
+  function screenAngle() {
+    if (screen.orientation && typeof screen.orientation.angle === 'number') return screen.orientation.angle;
+    return typeof window.orientation === 'number' ? window.orientation : 0;
+  }
+  var gotAbsolute = false;
+  function onOrient(e, isAbsEvent) {
+    var hd = null;
+    if (typeof e.webkitCompassHeading === 'number' && !isNaN(e.webkitCompassHeading)) {
+      hd = e.webkitCompassHeading; // iOS: already clockwise from north
+      state.compassMsg = 'iOS compass';
+    } else if (e.alpha != null && (isAbsEvent || e.absolute === true)) {
+      hd = 360 - e.alpha;          // alpha is counter-clockwise
+      state.compassMsg = 'absolute orientation';
+    } else if (e.alpha != null && !gotAbsolute) {
+      hd = 360 - e.alpha;
+      state.compassMsg = 'relative orientation (may not be true north)';
+    }
+    if (hd == null) return;
+    if (isAbsEvent) gotAbsolute = true;
+    state.heading = norm360(hd + screenAngle());
+    state.compassOK = true;
+  }
+  function startCompass() {
+    var hasDO = typeof window.DeviceOrientationEvent !== 'undefined';
+    if (!hasDO) { state.compassMsg = 'not supported on this device'; updateStatus(); return Promise.resolve(); }
+    var p = Promise.resolve('granted');
+    if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+      p = DeviceOrientationEvent.requestPermission().catch(function () { return 'denied'; });
+    }
+    return p.then(function (res) {
+      if (res !== 'granted') { state.compassMsg = 'motion permission denied (Settings › Safari › Motion & Orientation)'; updateStatus(); return; }
+      if ('ondeviceorientationabsolute' in window) {
+        window.addEventListener('deviceorientationabsolute', function (e) { onOrient(e, true); }, true);
+      }
+      window.addEventListener('deviceorientation', function (e) { onOrient(e, false); }, true);
+      state.compassMsg = 'listening…';
+      setTimeout(function () {
+        if (!state.compassOK) { state.compassMsg = 'no compass data (desktop or no sensor)'; updateStatus(); }
+      }, 3000);
+      updateStatus();
+    });
+  }
+
+  // ---------- Geolocation ----------
+  function setLocation(lat, lon, src) {
+    state.lat = lat; state.lon = lon; state.locSource = src;
+    state.geoMsg = src + ' ' + lat.toFixed(4) + ', ' + lon.toFixed(4);
+    updateTarget(); updateStatus();
+  }
+  function startGeo() {
+    if (!('geolocation' in navigator)) { state.geoMsg = 'not supported, enter manually'; showManual(); updateStatus(); return; }
+    state.geoMsg = 'locating…'; updateStatus();
+    navigator.geolocation.getCurrentPosition(function (pos) {
+      setLocation(pos.coords.latitude, pos.coords.longitude, 'GPS ±' + Math.round(pos.coords.accuracy) + 'm');
+    }, function (err) {
+      state.geoMsg = (err.code === 1 ? 'denied' : 'unavailable') + ', enter manually';
+      showManual(); updateStatus();
+    }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 });
+  }
+  function showManual() { $('manual').style.display = 'flex'; }
+  $('mset').addEventListener('click', function () {
+    var la = parseFloat($('mlat').value), lo = parseFloat($('mlon').value);
+    if (isNaN(la) || isNaN(lo) || Math.abs(la) > 90 || Math.abs(lo) > 180) { state.geoMsg = 'invalid manual coords'; updateStatus(); return; }
+    setLocation(la, lo, 'manual');
+  });
+
+  // ---------- Target ----------
+  function parseCoords(s) {
+    var m = s.trim().match(/^(-?\d+(?:\.\d+)?)\s*[,;\s]\s*(-?\d+(?:\.\d+)?)$/);
+    if (!m) return null;
+    var la = parseFloat(m[1]), lo = parseFloat(m[2]);
+    if (Math.abs(la) > 90 || Math.abs(lo) > 180) return null;
+    return { lat: la, lon: lo };
+  }
+  function search(q) {
+    q = (q || '').trim(); if (!q) return;
+    $('q').blur();
+    var c = parseCoords(q);
+    if (c) { setTarget({ name: c.lat.toFixed(4) + ', ' + c.lon.toFixed(4), lat: c.lat, lon: c.lon }); return; }
+    $('big').textContent = '…'; $('sub').textContent = 'Searching "' + q + '"'; $('dist').textContent = '';
+    geocode(q).then(function (r) {
+      r.short = q; setTarget(r);
+    }).catch(function (e) {
+      $('big').textContent = 'Not found'; $('sub').textContent = e.message; $('dist').textContent = '';
+    });
+  }
+  function setTarget(t) { state.target = t; $('live').classList.remove('primary'); updateTarget(); }
+  function updateTarget() {
+    if (!state.target) return;
+    var t = state.target;
+    $('big').textContent = t.short || t.name.split(',')[0];
+    $('sub').textContent = t.name;
+    if (state.lat != null) {
+      var b = bearing(state.lat, state.lon, t.lat, t.lon);
+      $('dist').textContent = fmtKm(haversineKm(state.lat, state.lon, t.lat, t.lon)) + ' · ' + Math.round(b) + '° ' + cardinal(b);
+    } else $('dist').textContent = 'Need your location for distance';
+  }
+  function goLive() {
+    state.target = null; $('live').classList.add('primary');
+    $('big').textContent = state.liveCountry || '—';
+    $('sub').textContent = 'Rotate your phone to point at a country';
+    $('dist').textContent = '';
+  }
+  $('go').addEventListener('click', function () { search($('q').value); });
+  $('q').addEventListener('keydown', function (e) { if (e.key === 'Enter') search($('q').value); });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-q]'), function (b) {
+    b.addEventListener('click', function () { $('q').value = b.getAttribute('data-q'); search(b.getAttribute('data-q')); });
+  });
+  $('live').addEventListener('click', goLive);
+
+  // ---------- Live "what am I pointing at" ----------
+  // Samples points along the great circle in the pointed direction; reports the first
+  // country that isn't your own (falls back to the nearest hit). One request per ~1.5s, cached.
+  var liveBusy = false, lastLiveKey = null;
+  var SAMPLE_KM = [300, 800, 1500, 2500, 4000, 6000, 9000];
+  var homeCountry = null;
+  function liveTick() {
+    if (state.target || liveBusy || state.lat == null || state.smoothHeading == null) return;
+    var h = Math.round(state.smoothHeading / 5) * 5;
+    var key = state.lat.toFixed(1) + ',' + state.lon.toFixed(1) + '@' + h;
+    if (key === lastLiveKey) return;
+    liveBusy = true;
+    var found = null, idx = 0;
+    function step() {
+      if (idx >= SAMPLE_KM.length || state.target) return Promise.resolve();
+      var km = SAMPLE_KM[idx++];
+      var p = destination(state.lat, state.lon, h, km);
+      return reverseCountry(p.lat, p.lon).then(function (c) {
+        if (c && (!homeCountry || c !== homeCountry)) { found = { country: c, km: km }; return; }
+        if (c && !found) found = { country: c, km: km, home: true };
+        // stop early if we only ever see home after a few samples
+        if (Math.abs(angDiff(h, state.smoothHeading)) > 15) return; // user turned; restart
+        return step();
+      });
+    }
+    var first = homeCountry ? Promise.resolve() :
+      reverseCountry(state.lat, state.lon).then(function (c) { homeCountry = c; });
+    first.then(step).then(function () {
+      lastLiveKey = key;
+      if (state.target) return;
+      state.liveCountry = found ? found.country : 'Open ocean';
+      $('big').textContent = state.liveCountry;
+      $('sub').textContent = Math.round(state.smoothHeading) + '° ' + cardinal(state.smoothHeading) +
+        (found ? ' · ~' + fmtKm(found.km) + ' away' : '');
+    }).catch(function (e) {
+      $('sub').textContent = 'Lookup failed: ' + e.message;
+    }).then(function () { liveBusy = false; });
+  }
+  setInterval(liveTick, 400);
+
+  // ---------- Status ----------
+  function updateStatus() {
+    $('status').innerHTML = 'Compass: <b>' + state.compassMsg + '</b>' +
+      (state.smoothHeading != null ? ' (' + Math.round(state.smoothHeading) + '°)' : '') +
+      '<br>Location: <b>' + state.geoMsg + '</b>';
+  }
+  setInterval(updateStatus, 500);
+
+  // ---------- Start (user gesture needed for iOS permission) ----------
+  $('start').addEventListener('click', function () {
+    $('overlay').classList.add('hidden');
+    startCompass().then(startGeo);
+    goLive();
+  });
+  if (!window.isSecureContext) {
+    state.compassMsg = 'needs HTTPS or localhost'; state.geoMsg = 'needs HTTPS or localhost';
+  }
+  updateStatus();
+})();
+</script>
+</body>
+</html>
